@@ -776,21 +776,13 @@ class VoiceManager {
       }
     });
 
-    // The admin turned the relay off mid-call: carry on with direct
+    // The relay cannot carry this call any more — it was turned off, its
+    // worker died, or the server restarted under it. Everything that came
+    // through it is dead, so it is torn down and the call finishes on direct
     // connections. Of each pair, only the side with the higher user id makes
     // the offer, so the two never offer to each other at once.
     this.socket.on('relay:ended', async (data) => {
-      const code = data?.channelCode;
-      if (!code || code !== this.currentChannel || this._callTransport !== 'relay') return;
-      console.warn('[Relay] The relay was turned off; switching this call to direct connections.');
-      this._callTransport = 'direct';
-      this._closeRelay();
-      const me = this.localUserId;
-      for (const [userId, info] of this._voiceUserInfo) {
-        if (userId === me || this.peers.has(userId) || !(me > userId)) continue;
-        if (!this.inVoice || this.currentChannel !== code) return;
-        await this._createPeer(userId, info.username, true);
-      }
+      await this._fallbackToDirect(data?.channelCode, 'the relay ended');
     });
 
     // Someone new joined our voice channel — they'll send us an offer
@@ -3701,7 +3693,15 @@ class VoiceManager {
       onTrackEnded: (t) => this._onRelayTrackEnded(t),
       onLost: (why) => {
         console.warn('[Relay] Session lost:', why);
-        if (this._relay === session) this._restartRelaySoon(code, generation);
+        if (this._relay !== session) return;
+        // The relay itself is gone (its worker died). The server has already
+        // moved this call to direct connections, so retrying the relay would
+        // just spin against a relay that is not there — fall back instead.
+        if (why === 'relay lost') {
+          this._fallbackToDirect(code, 'the relay lost its worker');
+          return;
+        }
+        this._restartRelaySoon(code, generation);
       },
     });
     this._relay = session;
@@ -3714,6 +3714,51 @@ class VoiceManager {
       console.warn('[Relay] Could not start:', err.message);
       if (this._relay === session) this._restartRelaySoon(code, generation);
     }
+  }
+
+  /**
+   * The relay cannot carry this call any more (it ended, its worker died, the
+   * server restarted under it, or a transport failed). Everything that came
+   * through it is dead media, so it is torn down here and the call finishes on
+   * direct connections. Shared by relay:ended, relay:lost and a transport that
+   * failed, so all three leave the same clean state: no relay session, no dead
+   * audio elements, and a direct peer to everybody in the call.
+   */
+  async _fallbackToDirect(code, why = 'the relay was lost') {
+    if (!code || code !== this.currentChannel || this._callTransport !== 'relay') return;
+    console.warn('[Relay]', why + '; switching this call to direct connections.');
+    this._callTransport = 'direct';
+    // _closeRelay drops the retry timer too: this relay is gone on purpose,
+    // so it must not be restarted underneath the direct call.
+    this._closeRelay();
+    // The session is closed, so its producers/consumers went with it. Anything
+    // we were receiving through it is dead media now, not a stalled one: drop
+    // the audio elements and markers so nobody keeps a silent track on screen
+    // while the direct path is negotiated.
+    for (const userId of [...(this._relayPeers || [])]) this._relayPeers.delete(userId);
+    // Screen and webcam came over the same dead session, so their views are
+    // closed even where the person is still marked as sharing: what is on
+    // screen came from the relay and is frozen, not live. _onRelayTrackEnded
+    // clears the markers and the views the person is no longer marked for;
+    // the extra call covers the ones who are, since their view is dead too.
+    for (const userId of [...this._screenDelivered || []]) {
+      this._onRelayTrackEnded({ userId, source: 'screen' });
+      if (this.screenSharers.has(userId)) this.onScreenStream?.(userId, null);
+    }
+    for (const userId of [...this.webcamUsers || []]) {
+      this._onRelayTrackEnded({ userId, source: 'webcam' });
+      if (this.webcamUsers.has(userId)) this.onWebcamStream?.(userId, null);
+    }
+    const me = this.localUserId;
+    for (const [userId, info] of this._voiceUserInfo) {
+      if (userId === me || this.peers.has(userId) || !(me > userId)) continue;
+      if (!this.inVoice || this.currentChannel !== code) return;
+      await this._createPeer(userId, info.username, true);
+    }
+    // The roster we cached is from the relayed call. Ask for the live one so
+    // anybody in the room but missing from the cache still gets a direct peer,
+    // and so we learn who is not relay-capable.
+    this.socket.emit('request-voice-users', { code });
   }
 
   _restartRelaySoon(code, generation) {

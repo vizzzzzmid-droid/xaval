@@ -85,6 +85,24 @@ module.exports = function register(socket, ctx) {
     }
   }
 
+  // The relay side of dropping somebody from a relayed call, for the paths in
+  // this file that remove a stale room entry without a clean leave. Same shape
+  // as handleVoiceLeave's: leave() is the real teardown, it is safe on a peer
+  // that is already gone (returning [] rather than throwing), so calling it for
+  // somebody who was never relayed is simply a no-op.
+  function clearRelaySession(code, userId) {
+    const relay = state.voiceRelay;
+    if (!relay) return;
+    try {
+      if (relay.currentKind(code) !== 'relay') return;
+      for (const producerId of relay.leave(code, `u${userId}`) || []) {
+        io.to(`voice:${code}`).emit('relay:producer-closed', { channelCode: code, producerId, userId });
+      }
+    } catch (err) {
+      console.warn(`[Voice] Relay cleanup for user ${userId} in "${code}" failed:`, err.message);
+    }
+  }
+
   const serializeVoicePeer = user => ({
     id: user.id,
     username: user.username,
@@ -295,6 +313,9 @@ module.exports = function register(socket, ctx) {
         // it, breaking audio for everyone. (#5347 v3.15.4 — mirrors the
         // fix already in voice-rejoin's stale-entry path.)
         voiceUsers.get(code).delete(socket.user.id);
+        // Their relay session goes with the room entry, or their transports and
+        // producers stay in the router until the call empties on its own.
+        clearRelaySession(code, socket.user.id);
         clearScreenState(code, socket.user.id);
         clearViewerState(code, socket.user.id);
         const remaining = voiceUsers.get(code);
@@ -1123,6 +1144,7 @@ module.exports = function register(socket, ctx) {
           // Stale entry — old socket already gone, just drop the map entry
           // so the broadcasted voice-user-left below can fire.
           voiceUsers.get(code).delete(socket.user.id);
+          clearRelaySession(code, socket.user.id);
           clearScreenState(code, socket.user.id);
           clearViewerState(code, socket.user.id);
           for (const [, u] of voiceUsers.get(code)) {

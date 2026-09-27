@@ -104,7 +104,10 @@
 
       this._on('relay:new-producer', (p) => { this._consume(p).catch(err => console.warn('[Relay] Could not receive a track:', err.message)); });
       this._on('relay:producer-closed', (p) => this._dropConsumer(p.producerId));
-      this._on('relay:lost', () => this.opts.onLost?.('relay restarted'));
+      // A dead worker is not something a reconnect fixes — the server has
+      // already moved the call to direct connections — so this is told apart
+      // from a transport that merely failed, which is worth retrying.
+      this._on('relay:lost', () => this.opts.onLost?.('relay lost'));
 
       const { producers } = await this._request('relay:producers', {});
       await Promise.all(producers.map(p => this._consume(p).catch(err => console.warn('[Relay] Could not receive a track:', err.message))));

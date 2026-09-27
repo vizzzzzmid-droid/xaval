@@ -74,6 +74,11 @@ function schedulePendingVoiceLeave({
 }
 
 function clearChannelRuntimeState(state, code) {
+  // The channel is gone. A relayed call in it has to be released here as well:
+  // the relay holds a router, and a transport, producer and consumer for every
+  // person in it, none of which anything else will ever come back to close.
+  // Without this the router (and its UDP port) survives the channel.
+  try { state.voiceRelay?.closeChannel?.(code); } catch { /* relay already gone */ }
   for (const name of [
     'channelUsers', 'voiceUsers', 'activeMusic', 'musicQueues',
     'activeScreenSharers', 'activeScreenSessions', 'activeWebcamUsers',
@@ -178,6 +183,12 @@ function rotateLiveChannelState(io, state, channelId, oldCode, newCode) {
       socket.emit('channel-code-rotated', rotation);
     }
   }
+
+  // A relayed call carries on across the rotation: the people talking are still
+  // on the same router with the same transports, so it is re-filed under the
+  // new code rather than torn down (which would drop their audio). Only the
+  // bookkeeping key changes.
+  try { state.voiceRelay?.renameChannel?.(oldCode, newCode); } catch { /* relay already gone */ }
 
   for (const map of [
     state.channelUsers,

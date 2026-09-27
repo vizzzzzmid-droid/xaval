@@ -173,13 +173,24 @@ function setupSocketHandlers(io, db, opts = {}) {
 
   // ── Voice relay (Large Server Setup) ─────────────────────
   // Off unless the admin turns it on. When its worker process goes away, the
-  // people in each relayed call are told to reconnect their media.
+  // call in each affected channel can no longer be relayed, so it is moved over
+  // to direct connections and the people in it are told to carry on directly.
+  //
+  // relay:ended (not relay:lost) is deliberate: with the worker gone there is
+  // nothing to reconnect to, so a client that tried would only spin on a dead
+  // relay. Direct connections still work between the people who are left, which
+  // is the whole point of keeping them as the fallback.
   state.voiceRelay = createVoiceRelay({
     getSetting: (key) => {
       try { return db.prepare('SELECT value FROM server_settings WHERE key = ?').get(key)?.value ?? null; }
       catch { return null; }
     },
-    onRoomLost: (code) => io.to(`voice:${code}`).emit('relay:lost', { channelCode: code }),
+    onRoomLost: (code) => {
+      // Releases the relay's resources for the call and pins its kind to
+      // 'direct', so a later join is not sent back into a dead relay.
+      state.voiceRelay?.fallback?.(code);
+      io.to(`voice:${code}`).emit('relay:ended', { channelCode: code });
+    },
     onRelayEnded: (code) => io.to(`voice:${code}`).emit('relay:ended', { channelCode: code }),
   });
   state.voiceRelay.boot().catch(err => console.error('Voice relay did not start:', err.message));
@@ -736,6 +747,39 @@ function setupSocketHandlers(io, db, opts = {}) {
     }
   }
 
+  // ── relay cleanup for one person ────────────────────────
+  // The relay side of leaving a call, in one place, so every path that drops
+  // somebody from the voice room (a real leave, a stale prune, the temp-channel
+  // sweep) frees the same things. Mirrors handleVoiceLeave, which is the
+  // original working version of this.
+  //
+  // voiceRelay.leave() is the real teardown: it closes that person's transports
+  // (and with them their producers and consumers) and closes the router once
+  // the call is empty. It is written to be safe on a peer whose mediasoup
+  // objects are already gone, and it returns an empty list for a peer that was
+  // never in the call, so calling it twice is a no-op rather than an error —
+  // which is what makes this safe to run from the cleanup paths that can
+  // overlap (a disconnect and a prune racing on the same ghost).
+  function leaveVoiceRelay(code, userId) {
+    const relay = state.voiceRelay;
+    if (!relay) return [];
+    try {
+      if (relay.currentKind(code) !== 'relay') return [];
+      return relay.leave(code, `u${userId}`) || [];
+    } catch (err) {
+      // Never let relay teardown break the voice cleanup around it.
+      console.warn(`[Voice] Relay cleanup for user ${userId} in "${code}" failed:`, err.message);
+      return [];
+    }
+  }
+
+  /** leaveVoiceRelay + telling the rest of the call their tracks stopped. */
+  function leaveVoiceRelayAndAnnounce(code, userId) {
+    for (const producerId of leaveVoiceRelay(code, userId)) {
+      io.to(`voice:${code}`).emit('relay:producer-closed', { channelCode: code, producerId, userId });
+    }
+  }
+
   // ── pruneStaleVoiceUsers ────────────────────────────────
   // Returns an array of removed { id, username } so callers can decide
   // whether to broadcast a fresh roster. We do NOT broadcast from inside
@@ -758,6 +802,12 @@ function setupSocketHandlers(io, db, opts = {}) {
       if (!sock || !sock.connected) {
         if (entry.isBot) botAudioManager?.stopWebhook(-Number(userId));
         room.delete(userId);
+        // A person pruned out of a relayed call must leave the relay too, or
+        // their peer stays in the router for good: the transports and producers
+        // are never closed, the call never empties so the router is never
+        // closed, and a room that looks empty to everyone else keeps a UDP port
+        // and a worker slot busy. This is the same teardown a real leave does.
+        leaveVoiceRelayAndAnnounce(code, userId);
         clearNativeScreenOfferWindows(nativeScreenOfferWindows, code, userId);
         const sharers = activeScreenSharers.get(code);
         if (sharers) {
@@ -781,6 +831,11 @@ function setupSocketHandlers(io, db, opts = {}) {
     }
     if (room.size === 0) {
       voiceUsers.delete(code);
+      // The call is over for everyone: drop the kind it was settled with, so a
+      // later call in a new channel picks its kind afresh. (The relay's own
+      // resources are already gone by this point — the last person out closed
+      // them via leaveVoiceRelay.)
+      state.voiceRelay?.callEnded?.(code);
       activeMusic.delete(code);
       syncMusicActivity(code);
       musicQueues.delete(code);
@@ -1187,11 +1242,9 @@ function setupSocketHandlers(io, db, opts = {}) {
     if (socket.user.isBot) botAudioManager?.stopWebhook(socket.user.webhookId);
     voiceRoom.delete(socket.user.id);
     // A relayed call: stop what this person was sending through the relay.
-    if (state.voiceRelay.currentKind(code) === 'relay') {
-      for (const producerId of state.voiceRelay.leave(code, `u${socket.user.id}`)) {
-        io.to(`voice:${code}`).emit('relay:producer-closed', { channelCode: code, producerId, userId: socket.user.id });
-      }
-    }
+    // Same helper the stale-prune path uses, so a person removed from the room
+    // by either path frees exactly the same mediasoup resources.
+    leaveVoiceRelayAndAnnounce(code, socket.user.id);
     if (voiceRoom.size === 0) state.voiceRelay.callEnded(code);
     clearNativeScreenOfferWindows(nativeScreenOfferWindows, code, socket.user.id);
     socket.leave(`voice:${code}`);
@@ -1773,6 +1826,10 @@ function setupSocketHandlers(io, db, opts = {}) {
             if (!sock || !sock.connected) {
               if (entry.isBot) botAudioManager?.stopWebhook(-Number(userId));
               room.delete(userId);
+              // Same teardown as pruneStaleVoiceUsers: a relayed ghost has to be
+              // dropped from the relay as well, or it keeps its transports and
+              // the call's router alive forever.
+              leaveVoiceRelayAndAnnounce(ch.code, userId);
               clearNativeScreenOfferWindows(nativeScreenOfferWindows, ch.code, userId);
               const sharers = activeScreenSharers.get(ch.code);
               if (sharers) {

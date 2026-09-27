@@ -307,6 +307,55 @@ class MediasoupRelay {
     return closed;
   }
 
+  /**
+   * Releases everything one call held in the relay: every peer's producers,
+   * consumers and transports, then its router, and its place in the worker.
+   * Used when the call's channel is deleted or its code rotated, where the
+   * people are gone from the call as a whole rather than one at a time.
+   * Safe to call again, and safe on a call whose mediasoup objects have already
+   * gone (a worker crash leaves handles that throw when closed).
+   * @returns {number} how many peers were released
+   */
+  closeChannel(code) {
+    const room = this.rooms.get(code);
+    if (!room) return 0;
+    // Drop it first, so a peer disappearing mid-teardown cannot close the
+    // router twice or put the call back in a worker slot.
+    this.rooms.delete(code);
+    try { room.slot.rooms.delete(code); } catch { /* gone */ }
+    for (const peer of room.peers.values()) {
+      for (const p of peer.producers.values()) { try { p.close(); } catch { /* gone */ } }
+      for (const c of peer.consumers.values()) { try { c.close(); } catch { /* gone */ } }
+      for (const t of peer.transports.values()) { try { t.close(); } catch { /* gone */ } }
+      peer.producers.clear();
+      peer.consumers.clear();
+      peer.transports.clear();
+      peer.watching.clear();
+    }
+    const count = room.peers.size;
+    room.peers.clear();
+    try { room.router.close(); } catch { /* gone */ }
+    return count;
+  }
+
+  /** A call's code changed while it was live: carry the relay over with it. */
+  renameChannel(oldCode, newCode) {
+    if (oldCode === newCode) return false;
+    const room = this.rooms.get(oldCode);
+    if (!room) return false;
+    // Something is already filed under the new code (a call that started after
+    // the rotation). Only one router per code is possible, so the old call is
+    // released rather than silently orphaned, holding a worker slot forever.
+    if (this.rooms.has(newCode)) { this.closeChannel(oldCode); return false; }
+    this.rooms.delete(oldCode);
+    this.rooms.set(newCode, room);
+    try {
+      room.slot.rooms.delete(oldCode);
+      room.slot.rooms.add(newCode);
+    } catch { /* worker already gone */ }
+    return true;
+  }
+
   inCall(code, peerId) {
     return !!this.rooms.get(code)?.peers.has(peerId);
   }
