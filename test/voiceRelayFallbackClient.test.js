@@ -95,7 +95,8 @@ test('#5 a lost relay drops the relay state and rebuilds the call peer to peer',
   assert.equal(manager.inVoice, true);
   assert.equal(manager.currentChannel, '11111111');
   assert.equal(manager.peers.size, 1, 'B now has a direct peer for A');
-  assert.equal([...manager.peers.keys()][0], 1, 'which is A');
+  // We are A (id 1) and B (id 2) is the other person, so the peer is B.
+  assert.equal([...manager.peers.keys()][0], 2, 'which is B');
   assert.ok(
     emitted.some(e => e.event === 'request-voice-users' && e.data.code === '11111111'),
     'and the live roster is re-fetched'

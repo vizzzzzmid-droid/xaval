@@ -2262,6 +2262,13 @@ function setupSocketHandlers(io, db, opts = {}) {
       // 429s, so this is the cap that protects the bot, not the database. The
       // composer debounces at 250ms, so typing cannot reach it.
       ferrySearch: { max: 8, windowMs: 10000 },
+      // Every relay:consume makes the server create a real mediasoup Consumer
+      // and allocate an RTP stream for it, so an unbounded loop is the one
+      // message in the relay that costs more the more often it is sent. A
+      // legitimate client consumes once per track the call has (mic, screen,
+      // screen-audio, webcam per person), plus a few on reconnect, so a
+      // generous cap well above one call's worth of tracks is not in the way.
+      relayConsume: { max: 40, windowMs: 10000 },
     };
 
     function floodCheck(bucket, scope = '') {

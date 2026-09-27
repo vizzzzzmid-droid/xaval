@@ -23,6 +23,13 @@ const { loadMediasoup } = require('./addon');
 
 const NOT_INSTALLED = 'The relay is not installed yet. Install it from Large Server Setup.';
 
+// Sources that are only carried to the people actually looking at them. A
+// screen share's video and its audio are one thing to the viewer: opening the
+// tile starts both, closing it stops both. Carrying a screen's audio to the
+// whole call is what made a silent desktop a full-rate audio stream to
+// everyone, which is the cost this gating exists to avoid.
+const GATED_SOURCES = new Set(['screen', 'screen-audio']);
+
 const MEDIA_CODECS = [
   { kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
   { kind: 'video', mimeType: 'video/VP8', clockRate: 90000 },
@@ -179,7 +186,17 @@ class MediasoupRelay {
     // `watching`: sharers whose screen this person has open. Screen video is
     // only sent while it is, which is what keeps big screen shares affordable:
     // the server's upload goes to the people looking, not to the whole call.
-    const peer = { userId, transports: new Map(), producers: new Map(), consumers: new Map(), watching: new Set() };
+    const peer = {
+      userId,
+      transports: new Map(),
+      producers: new Map(),
+      consumers: new Map(),
+      watching: new Set(),
+      // Server-side mute lives here, not on the producer, so a mute that
+      // arrives before the mic is published (or after a rejoin rebuilds the
+      // producers) is still in force when the track shows up.
+      pausedSources: new Set(),
+    };
     room.peers.set(peerId, peer);
     const make = async (direction) => {
       const t = await room.router.createWebRtcTransport({
@@ -216,6 +233,10 @@ class MediasoupRelay {
     }
     const producer = await t.produce({ kind, rtpParameters, appData: { source, userId: peer.userId } });
     peer.producers.set(producer.id, producer);
+    // A source muted before it was published (or republishing after a device
+    // switch while still muted) starts paused, so the mute does not leak a
+    // burst of audio to the call while the round trip catches up.
+    if (peer.pausedSources.has(source)) await producer.pause();
     return producer.id;
   }
 
@@ -249,17 +270,29 @@ class MediasoupRelay {
     return out;
   }
 
-  /** Starts receiving one track. Arrives paused; resume once it is wired up. */
-  async consume(code, peerId, producerId, rtpCapabilities) {
+  /**
+   * Starts receiving one track. Arrives paused; resume once it is wired up.
+   * @param {object} [opts]
+   * @param {number} [opts.micBitrate] cap for a mic, in bits per second. The
+   *   channel's voice bitrate setting, which was previously only honoured on
+   *   direct connections: a relayed call ignored it, so a channel capped at
+   *   32 kbps still cost the server a full-rate stream per person. Applied on
+   *   the receiving side, which is where the server's own bandwidth goes, and
+   *   is the cap the admin asked for regardless of what the sender negotiated.
+   */
+  async consume(code, peerId, producerId, rtpCapabilities, { micBitrate = 0 } = {}) {
     const { room, peer } = this._peer(code, peerId);
     if (!room.router.canConsume({ producerId, rtpCapabilities })) return null;
     const t = [...peer.transports.values()].find(x => x.appData.direction === 'recv');
     if (!t) throw new Error('No receiving connection');
     const owner = [...room.peers.values()].find(p => p.producers.has(producerId));
     const source = owner?.producers.get(producerId)?.appData.source ?? null;
+    const encodings = (source === 'mic' && micBitrate > 0) ? [{ maxBitrate: micBitrate }] : undefined;
     const consumer = await t.consume({
-      producerId, rtpCapabilities, paused: true,
-      appData: { source, sharerId: owner?.userId ?? null },
+      producerId, rtpCapabilities, paused: true, encodings,
+      // Recorded so the cap in force is knowable after the fact: mediasoup does
+      // not report the requested maxBitrate back in the consumer's SDP.
+      appData: { source, sharerId: owner?.userId ?? null, micBitrate: encodings?.[0]?.maxBitrate ?? null },
     });
     peer.consumers.set(consumer.id, consumer);
     consumer.on('producerclose', () => peer.consumers.delete(consumer.id));
@@ -275,20 +308,56 @@ class MediasoupRelay {
     const { peer } = this._peer(code, peerId);
     const c = peer.consumers.get(consumerId);
     if (!c) return;
-    // Screen video waits until its tile is open (setWatching).
-    if (c.appData.source === 'screen' && !peer.watching.has(c.appData.sharerId)) return;
+    // A screen's video and its audio both wait until its tile is open.
+    if (GATED_SOURCES.has(c.appData.source) && !peer.watching.has(c.appData.sharerId)) return;
     await c.resume();
   }
 
-  /** The person opened (or closed) a sharer's screen: start or stop its video. */
+  /** The person opened (or closed) a sharer's screen: start or stop it. */
   async setWatching(code, peerId, sharerId, watching) {
     const peer = this.rooms.get(code)?.peers.get(peerId);
     if (!peer) return;
     if (watching) peer.watching.add(sharerId); else peer.watching.delete(sharerId);
     for (const c of peer.consumers.values()) {
-      if (c.appData.source !== 'screen' || c.appData.sharerId !== sharerId || c.closed) continue;
+      if (!GATED_SOURCES.has(c.appData.source) || c.appData.sharerId !== sharerId || c.closed) continue;
       if (watching) await c.resume(); else await c.pause();
     }
+  }
+
+  /**
+   * Server-side mute: stops the RTP itself, not just playback. A muted person
+   * still has their producer (so unmuting is instant) but the stream stops
+   * crossing the server — the other participants' consumers go silent at the
+   * source instead of receiving silence-shaped packets.
+   *
+   * Keyed by source, not producer id, so a fresh producer (a new mic after a
+   * device switch, or the one rebuilt on rejoin) is muted the same way the old
+   * one was, and a mute that arrives before the mic is published still sticks.
+   * @returns {Promise<number>} how many producers changed
+   */
+  async setPeerSourcePaused(code, peerId, source, paused) {
+    const peer = this.rooms.get(code)?.peers.get(peerId);
+    if (!peer) return 0;
+    if (paused) {
+      if (peer.pausedSources.has(source)) return 0;
+      peer.pausedSources.add(source);
+    } else {
+      if (!peer.pausedSources.has(source)) return 0;
+      peer.pausedSources.delete(source);
+    }
+    let changed = 0;
+    for (const p of peer.producers.values()) {
+      if (p.appData.source !== source) continue;
+      if (paused) { if (!p.paused) { await p.pause(); changed++; } }
+      else if (p.paused) { await p.resume(); changed++; }
+    }
+    return changed;
+  }
+
+  /** What this person has muted at the relay, so a rejoin can restore it. */
+  pausedSources(code, peerId) {
+    const peer = this.rooms.get(code)?.peers.get(peerId);
+    return peer ? [...peer.pausedSources] : [];
   }
 
   /** Leaves a call. Returns the ids of the tracks that stopped. */

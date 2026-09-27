@@ -13,6 +13,7 @@
  *   relay:producers  -> what everyone else is sending right now
  *   relay:consume    -> start receiving one of those
  *   relay:resume     -> unpause a received track once it is wired up
+ *   relay:set-paused -> server-side mute of one of your own sources
  *   relay:close-producer -> stop sending a track
  *
  * The server announces relay:new-producer and relay:producer-closed to the
@@ -20,12 +21,26 @@
  */
 
 const SOURCES = new Set(['mic', 'screen', 'screen-audio', 'webcam']);
+// A person can only mute their own microphone this way. Screen audio is
+// paused for the *viewers* (by whether they have the tile open), not by the
+// sharer, so allowing it here would let one member silence everybody's audio.
+const MUTABLE = new Set(['mic']);
 const ID = /^[A-Za-z0-9-]{1,64}$/;
 
 module.exports = function registerVoiceRelay(socket, ctx) {
-  const { io, state } = ctx;
+  const { io, state, db, floodCheck } = ctx;
   const { voiceUsers, activeScreenSharers, activeWebcamUsers, voiceRelay } = state;
   if (!voiceRelay) return;
+
+  // The channel's voice bitrate setting, in bits per second, for the server to
+  // cap each mic stream at. Read per call rather than cached: the admin can
+  // change it while a call is running, and the next track started picks it up.
+  function micBitrate(code) {
+    try {
+      const kbps = db.prepare('SELECT voice_bitrate FROM channels WHERE code = ?').get(code)?.voice_bitrate || 0;
+      return kbps > 0 ? kbps * 1000 : 0;
+    } catch { return 0; }
+  }
 
   const peerId = () => `u${socket.user.id}`;
 
@@ -96,9 +111,35 @@ module.exports = function registerVoiceRelay(socket, ctx) {
 
   handle('relay:consume', async ({ code, producerId, rtpCapabilities }) => {
     if (!ID.test(String(producerId)) || !rtpCapabilities || typeof rtpCapabilities !== 'object') throw new Error('Bad request');
-    const consumer = await voiceRelay.consume(code, peerId(), producerId, rtpCapabilities);
+    // Consume is the one relay call a client can repeat freely with different
+    // producer ids, and each one that lands costs a real consumer in the
+    // router — enough of them fill the call's resources on their own, and they
+    // are what a runaway or hostile client loops on. Producers are few and
+    // bounded, so consuming past this budget is never legitimate.
+    if (floodCheck('relayConsume', code)) {
+      throw new Error('Slow down — too many tracks requested at once');
+    }
+    const consumer = await voiceRelay.consume(code, peerId(), producerId, rtpCapabilities, { micBitrate: micBitrate(code) });
     if (!consumer) throw new Error('This track cannot be played here');
     return { consumer };
+  });
+
+  handle('relay:set-paused', async ({ code, source, paused }) => {
+    // Only the microphone. Screen audio is already gated per viewer, so the
+    // sharer has no business pausing it for the whole call, and nothing else
+    // is a thing a person mutes about themselves.
+    if (source !== 'mic' || typeof paused !== 'boolean') throw new Error('Bad request');
+    // Server-side mute: the RTP itself stops, so the rest of the call stops
+    // receiving this track rather than receiving silence. Only the person
+    // sending it can mute it — the server never mutes somebody for them.
+    if (await voiceRelay.setPeerSourcePaused(code, peerId(), source, paused)) {
+      // Tell the call so viewers can show the muted state and drop the audio
+      // element; the consumers themselves are already silent at the source.
+      socket.to(`voice:${code}`).emit('relay:producer-paused', {
+        channelCode: code, userId: socket.user.id, source, paused,
+      });
+    }
+    return {};
   });
 
   handle('relay:resume', async ({ code, consumerId }) => {
@@ -120,5 +161,5 @@ module.exports = function registerVoiceRelay(socket, ctx) {
 
 module.exports.RELAY_EVENTS = [
   'relay:join', 'relay:connect', 'relay:produce', 'relay:producers',
-  'relay:consume', 'relay:resume', 'relay:close-producer',
+  'relay:consume', 'relay:resume', 'relay:set-paused', 'relay:close-producer',
 ];

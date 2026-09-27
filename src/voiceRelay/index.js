@@ -171,6 +171,10 @@ function createVoiceRelay({ getSetting, onRoomLost, onRelayEnded = () => {} }) {
     produce: (...a) => builtin.produce(...a),
     closeProducer: (...a) => builtin.closeProducer(...a),
     setProducerPaused: (...a) => builtin.setProducerPaused(...a),
+    // Server-side mute, by source. Kept next to setProducerPaused because both
+    // stop the same thing (a track crossing the server) at a different grain.
+    setPeerSourcePaused: (...a) => builtin.setPeerSourcePaused(...a),
+    pausedSources: (...a) => builtin.pausedSources(...a),
     producers: (...a) => builtin.producers(...a),
     consume: (...a) => builtin.consume(...a),
     resumeConsumer: (...a) => builtin.resumeConsumer(...a),

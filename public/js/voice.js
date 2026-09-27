@@ -2498,6 +2498,12 @@ class VoiceManager {
     if (this.isListenerOnly) { this.isMuted = true; return true; }
     this.isMuted = !this.isMuted;
     this._applyMuteStateToLocalTracks();
+    // Second level, only meaningful through the relay: the local track above
+    // stops what the browser sends, this stops the stream crossing the server
+    // at all. Failures are ignored on purpose — the local mute already worked,
+    // and the server keeps the paused state, so a retry comes with the next
+    // mute or the next rejoin rather than with an error the user cannot act on.
+    this._relay?.setPaused('mic', this.isMuted).catch(() => {});
     return this.isMuted;
   }
 
@@ -3691,6 +3697,7 @@ class VoiceManager {
       iceTransportPolicy: this.rtcConfig.iceTransportPolicy,
       onTrack: (t) => this._onRelayTrack(t),
       onTrackEnded: (t) => this._onRelayTrackEnded(t),
+      onProducerPaused: (p) => this._onRelayProducerPaused(p),
       onLost: (why) => {
         console.warn('[Relay] Session lost:', why);
         if (this._relay !== session) return;
@@ -3750,9 +3757,16 @@ class VoiceManager {
       if (this.webcamUsers.has(userId)) this.onWebcamStream?.(userId, null);
     }
     const me = this.localUserId;
+    // Both ends create the peer, exactly as on a fresh join (see
+    // voice-existing-users): one offer each, and the glare tie-break in
+    // _isPolite decides which one wins, so nobody has to guess who starts.
+    // Picking a side here instead would leave the polite half with a peer
+    // nobody ever offered to, and the call stays silent.
     for (const [userId, info] of this._voiceUserInfo) {
-      if (userId === me || this.peers.has(userId) || !(me > userId)) continue;
-      if (!this.inVoice || this.currentChannel !== code) return;
+      if (userId === me || this.peers.has(userId)) continue;
+      // If we left or moved on while renegotiating, stop: a peer for a call we
+      // are no longer in would leak.
+      if (!this.inVoice || this.currentChannel !== code) break;
       await this._createPeer(userId, info.username, true);
     }
     // The roster we cached is from the relayed call. Ask for the live one so
@@ -3785,7 +3799,14 @@ class VoiceManager {
     const relay = this._relay;
     if (!relay) return;
     const mic = this.localStream?.getAudioTracks()[0];
-    if (mic && !this.isListenerOnly) await relay.publish('mic', mic).catch(err => console.warn('[Relay] Mic not sent:', err.message));
+    if (mic && !this.isListenerOnly) {
+      await relay.publish('mic', mic).catch(err => console.warn('[Relay] Mic not sent:', err.message));
+      // A fresh relay session has no memory of a mute, so it is re-applied
+      // here: a person who was muted must not start sending again just because
+      // they reconnected. The local track above is already disabled, so this is
+      // the same second level as an ordinary mute.
+      if (this.isMuted) await relay.setPaused('mic', true).catch(() => {});
+    }
     if (this.isScreenSharing && this.screenStream && !this._nativeScreenSharing) {
       const res = this.screenResolution;
       const maxBitrate = this._screenBitrates?.[res] || this._screenBitrates?.[0];
@@ -3815,6 +3836,9 @@ class VoiceManager {
 
   _onRelayTrackEnded({ userId, source }) {
     if (userId == null) return;
+    // Nothing left to be muted-at-the-server for, so a later rejoin of that
+    // person does not inherit a flag for a track that is gone.
+    this._relayPaused?.delete(userId);
     if (source === 'mic') {
       this._clearRemoteVoice(userId);
     } else if (source === 'screen-audio') {
@@ -3824,6 +3848,25 @@ class VoiceManager {
       if (!this.screenSharers.has(userId) && this.onScreenStream) this.onScreenStream(userId, null);
     } else if (source === 'webcam') {
       if (!this.webcamUsers.has(userId) && this.onWebcamStream) this.onWebcamStream(userId, null);
+    }
+  }
+
+  /**
+   * Somebody muted at the server, so their RTP stopped crossing it. The track
+   * itself is unchanged, so the audio element stays and is silenced here
+   * instead of being torn down and rebuilt on the next unmute — which is what
+   * makes a relayed unmute instant rather than a re-consume round trip.
+   */
+  _onRelayProducerPaused({ userId, source, paused }) {
+    if (userId == null) return;
+    // Kept per user so a later unmute (or a device switch that republishes the
+    // same source) finds the right state again.
+    const flags = this._relayPaused || (this._relayPaused = new Map());
+    const userFlags = flags.get(userId) || (flags.set(userId, new Set()), flags.get(userId));
+    if (paused) userFlags.add(source); else userFlags.delete(source);
+    if (source === 'mic') {
+      const el = document.getElementById(`voice-audio-${userId}`);
+      if (el) el.muted = !!paused;
     }
   }
 

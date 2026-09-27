@@ -104,6 +104,10 @@
 
       this._on('relay:new-producer', (p) => { this._consume(p).catch(err => console.warn('[Relay] Could not receive a track:', err.message)); });
       this._on('relay:producer-closed', (p) => this._dropConsumer(p.producerId));
+      // Somebody muted at the server, so their RTP is stopped, not silent. The
+      // consumer is already carrying nothing; the UI still needs telling, or
+      // the person looks like they are talking with no sound.
+      this._on('relay:producer-paused', (p) => this.opts.onProducerPaused?.({ userId: p.userId, source: p.source, paused: p.paused }));
       // A dead worker is not something a reconnect fixes — the server has
       // already moved the call to direct connections — so this is told apart
       // from a transport that merely failed, which is worth retrying.
@@ -181,6 +185,17 @@
     async replace(source, track) {
       const producer = this.producers.get(source);
       if (producer && !producer.closed) await producer.replaceTrack({ track });
+    }
+
+    /**
+     * Stops (or restarts) this session's own track at the server. This is the
+     * second level of mute: the local track is already disabled instantly, and
+     * this stops the RTP itself, so a relayed mute costs the call no stream
+     * instead of shipping silence. A person-only setting cannot be undone
+     * here, so the server is the one that remembers it across a rejoin.
+     */
+    async setPaused(source, paused) {
+      await this._request('relay:set-paused', { source, paused });
     }
 
     /** Stops sending `source`. */

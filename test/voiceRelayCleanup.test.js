@@ -264,6 +264,26 @@ function loadVoiceManager() {
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     console: { log() {}, warn() {}, error() {} },
     RTCSessionDescription: (d) => d,
+    // The fallback rebuilds the call peer to peer, so a peer connection is
+    // constructed for real. It never gets to connect here; the assertions are
+    // about which peers were (re)built, not about media.
+    RTCPeerConnection: class {
+      constructor() {
+        this.signalingState = 'stable';
+        this.connectionState = 'new';
+        this.iceConnectionState = 'new';
+      }
+      addEventListener() {}
+      removeEventListener() {}
+      createOffer() { return Promise.resolve({ type: 'offer', sdp: '' }); }
+      createAnswer() { return Promise.resolve({ type: 'answer', sdp: '' }); }
+      setLocalDescription() { return Promise.resolve(); }
+      setRemoteDescription() { return Promise.resolve(); }
+      addIceCandidate() { return Promise.resolve(); }
+      getSenders() { return []; }
+      getReceivers() { return []; }
+      close() { this.connectionState = 'closed'; }
+    },
     MediaStream: class { constructor(tracks) { this.tracks = tracks; } },
     document: { getElementById: () => null, createElement: () => ({ style: {}, addEventListener() {}, setAttribute() {} }) },
     window: {},
