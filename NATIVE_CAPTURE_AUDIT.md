@@ -164,6 +164,20 @@ connections, and the page has no tracks to publish.
 The SFU gate in `public/js/voice.js:1261` shows the design is deliberate:
 
 ```js
+if (!this._nativeScreenSharing && this._isRelayedPeer(targetUserId)) return;
+```
+
+i.e. a browser share skips relay-only viewers, while a native share still
+renegotiates for them. On the server, `relay:produce` for `screen`/`screen-audio`
+requires `activeScreenSharers.get(code)?.has(userId)` and for `webcam` an entry in
+`activeWebcamUsers` (`src/socketHandlers/voiceRelay.js`), and a producer needs a
+send `transport` from `relay:join` — none of which the native path creates. The
+`screen`/`screen-audio` producer `source` values and `GATED_SOURCES` viewer gating
+(`setWatching` in `src/voiceRelay/mediasoup.js`) exist, but only browser shares
+populate them.
+
+The only `havenDesktop.audio` reference in the whole web client is
+`public/js/voice.js:2093-2094`, `optOutOfDucking()`.
 
 ## 10. Browser vs native comparison
 
@@ -260,17 +274,3 @@ If the desktop app already implements per-process capture, this is Shape 1 and
 small; if it only does system loopback, excluding Haven audio is a new mechanism,
 not a wiring change.
 
-if (!this._nativeScreenSharing && this._isRelayedPeer(targetUserId)) return;
-```
-
-i.e. a browser share skips relay-only viewers, while a native share still
-renegotiates for them. On the server, `relay:produce` for `screen`/`screen-audio`
-requires `activeScreenSharers.get(code)?.has(userId)` and for `webcam` an entry in
-`activeWebcamUsers` (`src/socketHandlers/voiceRelay.js`), and a producer needs a
-send `transport` from `relay:join` — none of which the native path creates. The
-`screen`/`screen-audio` producer `source` values and `GATED_SOURCES` viewer gating
-(`setWatching` in `src/voiceRelay/mediasoup.js`) exist, but only browser shares
-populate them.
-
-The only `havenDesktop.audio` reference in the whole web client is
-`public/js/voice.js:2093-2094`, `optOutOfDucking()`.
