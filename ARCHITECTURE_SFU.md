@@ -827,15 +827,33 @@ boot».
 
 ### №7. Переключение simulcast-слоев под зрителя
 
-* **Файл**: `src/voiceRelay/mediasoup.js`, `consume()` (`:253-271`) + клиент.
-* **Сейчас**: 2 слоя создаются (`voice-relay.js:161-167`), но
-  `setPreferredLayers` не вызывается никогда — слой не адаптируется.
-* **Нужно**: `consumer.setPreferredLayers()` по сигналу клиента (новое
-  `relay:set-layer`) либо автоподбор; на клиенте — наблюдение за потерями
-  (`consumer.getStats()`) и запрос нижнего слоя.
+* **Статус (Фаза 3)**: сделано.
+* **Файл**: `src/voiceRelay/mediasoup.js`
+  (`setPreferredLayers()`, `_topLayer()`), `src/socketHandlers/voiceRelay.js`
+  (`relay:set-preferred-layers`), `public/js/voice-relay.js`
+  (`_recheckLayers()`).
+* **Слои**: клиент публикует экран в **2 spatial layer**
+  (`scaleResolutionDownBy: 2` и `1`, `voice-relay.js`). Третьего слоя нет, и
+  запрос за ним зажимается до верхнего существующего, а не отвергается.
+  `null` = «верхний слой», и он же `1`.
+* **Поток**: клиент смотрит на `recvTransport.connectionState`; при обрыве
+  просит `relay:set-preferred-layers { spatialLayer: 0 }`, при восстановлении
+  возвращает `null`. Сообщение уходит один раз на изменение, не на каждый
+  тик. Сервер берёт `peerId` **из сокета** (в payload его нельзя подделать),
+  ищет consumer этого peer'а по `producerId` и вызывает
+  `consumer.setPreferredLayers({ spatial, temporal })`; если такого consumer'а
+  нет — `Not receiving` без изменений.
+* **Изоляция**: consumer'ы разные, поэтому слой одного зрителя не трогает
+  другого и никак не влияет на producer. У `mic` и `screen-audio` один
+  encoding — слоёв нет, запрос отвергается (`no quality layers`). Слой не
+  связан с viewer-gating: сужение слоя не запускает закрытую трансляцию.
 * **Зачем**: слабый зритель получает слой 0, а не top-слой.
-* **Риск**: средний (дросселирование слоя может «прыгать»).
-* **Тест**: throttling сети в DevTools → слой 0, после снятия → 1.
+* **Ограничение (зафиксировано, не чинится здесь)**: сигнал сейчас бинарный
+  (connected / not connected). Полноценный ABR по `consumer.getStats()`
+  (packet loss, jitter) — Фаза 4+.
+* **Тест**: `test/voiceRelaySimulcast.test.js` — реальный mediasoup: слой
+  0/1, зажим за несуществующий, чужой producer, изоляция зрителей, валидация
+  в сокете, поведение клиента.
 
 ### №8. Единый путь для native desktop capture (стриминг в SFU)
 
@@ -876,15 +894,51 @@ boot».
 
 ### №11. Мониторинг и пределы worker'ов
 
-* **Файл**: `src/voiceRelay/mediasoup.js`, `status()` (`:66-75`).
-* **Сейчас**: `status()` отдаёт state/ports/calls/people — нет per-worker
-  нагрузки и нет предела звонков на worker.
-* **Нужно**: лимит rooms на worker (переброска/ошибка) + `rooms/transports`
-  per-worker в админ-статус.
-* **Зачем**: предсказуемость на больших серверах.
-* **Риск**: низкий.
-* **Тест**: `workers=1`, K звонков → статус показывает распределение; при
-  лимите новый звонок уходит на другой worker или получает понятную ошибку.
+* **Статус (Фаза 3)**: пределы сделаны; per-worker разбивка в админ-статусе — нет.
+* **Файл**: `src/voiceRelay/mediasoup.js` (`LIMITS`, `_start()`, `_room()`,
+  `join()`, `produce()`, `consume()`, `_workerDied()`).
+* **Пул worker'ов** (уже был, не переписывался): создаётся один раз на
+  `start()` в количестве из настройки `voice_relay_workers`; новый звонок
+  кладётся на worker с наименьшим числом звонков (`_room()`). Новые worker'ы
+  из запросов не создаются никогда.
+* **Предел worker'ов**: `HAVEN_SFU_MAX_WORKERS` (по умолчанию `8`, диапазон
+  1–64). Админское значение зажимается сверху этим потолком, с предупреждением
+  в лог; `MEDIASOUP_MAX_WORKERS` из ТЗ не вводился — в проекте префикс
+  настроек `HAVEN_*`.
+* **Пределы комнаты** (`LIMITS`, все через env):
+  | Предел | Env | По умолчанию |
+  |---|---|---|
+  | люди в звонке | `HAVEN_SFU_MAX_PEERS_PER_ROOM` | 100 |
+  | треков с одного peer'а | `HAVEN_SFU_MAX_PRODUCERS_PER_PEER` | 8 |
+  | треков на один peer | `HAVEN_SFU_MAX_CONSUMERS_PER_PEER` | 100 |
+  | screen-шеров в звонке | `HAVEN_SFU_MAX_SCREEN_SHARES` | 8 |
+
+  Значения рассчитаны на комнату 5–20 человек: один человек публикует не
+  больше 4 треков и получает не больше 3 за каждого другого, поэтому
+  20-человековый звонок с шером держится в пределах 60 consumer'ов. Каждая
+  проверка стоит **до** создания объекта, поэтому отказ не оставляет ни
+  producer'а, ни consumer'а, ни half-created transport, и звонок продолжает
+  работать для тех, кто в нём уже есть.
+* **Никакого worker'а**: `_room()` бросает ошибку, а не создаёт worker из
+  воздуха; звонок остаётся direct — существующий fallback, без нового пути.
+* **Смерть worker'а**: `died` → `closeChannel()` для каждого его звонка
+  (router, transports, producers, consumers — всё закрыто), затем `relay:lost`
+  в комнату и `onRoomLost` → фолбэк на P2P. Если worker'ов не осталось,
+  relay переходит в `state: 'error'` с читаемой причиной. Сервер не падает;
+  звонки на других worker'ах не затрагиваются. Автоматический перезапуск
+  worker'а не делается (не было и раньше): состояние `error` и новый
+  `start()` при следующем звонке.
+* **Остановка relay**: `stop()` закрывает каждый звонок через `closeChannel()`
+  (producer'ы, consumer'ы, transports, router), затем WebRTC-сервер и worker.
+  Раньше карта комнат просто очищалась, из-за чего живые объекты mediasoup
+  оставались и процессы worker'ов не завершались — исправлено в Фазе 3
+  (регрессия: `test/voiceRelayLimits.test.js`, кейс `#6`).
+* **Ограничение (зафиксировано)**: `status()` по-прежнему отдаёт общие
+  `calls`/`people`, без разбивки по worker'ам; лимита «звонков на worker» нет —
+  выравнивание по наименьшей загрузке достаточно для текущих размеров.
+* **Тест**: `test/voiceRelayLimits.test.js` (14 кейсов, реальный mediasoup) —
+  пул не растёт, потолок соблюдается, отказ без следа, остановка закрывает всё,
+  смерть worker'а.
 
 ---
 
@@ -1019,18 +1073,18 @@ Producers: ≤4 на участника (гарантируется `mediasoup.j
 | Feature | Status | Files | Notes |
 | --- | --- | --- | --- |
 | Voice SFU | PARTIAL | `src/voiceRelay/*`, `src/socketHandlers/voiceRelay.js`, `public/js/voice-relay.js` | Ядро реализовано и протестировано; выключен по умолчанию, работает смешано с P2P |
-| Mic | IMPLEMENTED | `voice.js:3743`, `voice-relay.js:153`, `mediasoup.js:209` | Opus DTX/FEC; bitrate-лимит канала не применяется (§22 №2) |
-| Mute | PARTIAL | `voice.js:2504-2523`, `mediasoup.js:231` | Только клиентский `track.enabled`; `setProducerPaused` NOT USED (§22 №1) |
+| Mic | IMPLEMENTED | `voice.js:3743`, `voice-relay.js:153`, `mediasoup.js:209` | Opus DTX/FEC; `voice_bitrate` применяется к consumer'у (§22 №2) |
+| Mute | IMPLEMENTED | `voice.js:2506`, `mediasoup.js` (`setPeerSourcePaused`), `voiceRelay.js` (`relay:set-paused`) | Server-side `Producer.pause()/resume()` + клиентский `track.enabled` (§22 №1) |
 | Deafen | PARTIAL | `voice.js:2525-2545` | Только `gain=0` на клиенте; SFU продолжает слать трафик |
-| Screen video | IMPLEMENTED | `voice.js:2687`, `voiceRelay.js:76`, `mediasoup.js:284` | Simulcast 2 слоя, viewer-gating, отдельный producer |
-| Screen audio | PARTIAL | `voice.js:3750`, `mediasoup.js:274` | Producer есть, но **без viewer-gating** (§22 №9) |
+| Screen video | IMPLEMENTED | `voice.js:2687`, `voiceRelay.js:76`, `mediasoup.js` (`setPreferredLayers`) | Simulcast 2 слоя + переключение слоя под зрителя, viewer-gating, отдельный producer |
+| Screen audio | IMPLEMENTED | `mediasoup.js` (gating в `consume`/`setWatching`) | Producer есть, viewer-gating работает (§22 №9) |
 | Native capture | PARTIAL | `nativeScreen.js`, `voice.js:1343-1830` | Полностью мимо SFU (прямые P2P); signaling реализован |
-| Simulcast | PARTIAL | `voice-relay.js:161-167` | 2 слоя только для screen; слои не переключаются (§22 №7) |
-| Reconnect | PARTIAL | `voice.js:3678-3729`, `voice-relay.js:138`, `voice.js:956` | Fast-path + resync + backoff есть; prune/fallback-дыры (§22 №3, №5) |
-| Cleanup | PARTIAL | `index.js:1166,743`, `channelRotation.js:76,143` | Явный leave чистит; prune/temp/rotate — нет (утечки) |
+| Simulcast | PARTIAL | `mediasoup.js` (`setPreferredLayers`, `_topLayer`), `voiceRelay.js` (`relay:set-preferred-layers`), `voice-relay.js` (`_recheckLayers`) | Слои выбираются по состоянию соединения; полноценный ABR по `getStats()` — нет (§22 №7) |
+| Reconnect | IMPLEMENTED | `voice.js:3678-3729`, `voice-relay.js:138`, `voice.js:956` | Fast-path + resync + backoff; prune и SFU→P2P fallback закрыты (§22 №3, №5) |
+| Cleanup | IMPLEMENTED | `index.js` (`leaveVoiceRelayAndAnnounce`), `channelRotation.js`, `mediasoup.js` (`closeChannel`) | Явный leave, prune, удаление и rotate временных каналов — все чистят relay |
 | TURN | PARTIAL | `admin.js:153,254`, `voice.js:141`, `server.js:980` | Настройка есть и пробрасывается в relay-транспорты; требует ручной настройки |
 | Permissions | IMPLEMENTED | `voice.js:217-247`, `voiceRelay.js:33-44`, `admin.js:556` | Все проверки на входе; повторной membership-проверки на `relay:*` нет (§22 №10) |
-| Multi-user rooms | PARTIAL | `mediasoup.js:153-166`, `voice.js:242` | Роутер на звонок, worker-шардинг; нет лимита участников/worker'ов (§22 №11) |
+| Multi-user rooms | IMPLEMENTED | `mediasoup.js` (`LIMITS`, `_start`, `_room`, `_workerDied`) | Worker-пул с потолком `HAVEN_SFU_MAX_WORKERS`, лимиты peer/producer/consumer/шеров, разбор смерти worker'а (§22 №11) |
 
 ---
 

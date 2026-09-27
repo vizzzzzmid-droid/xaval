@@ -95,6 +95,10 @@
         });
         t.on('connectionstatechange', (state) => {
           if (state === 'failed' && !this.closed) this.opts.onLost?.('connection failed');
+          // A link that has just come back is the moment to ask for the full
+          // screen layer again, and one that is going down the moment to give
+          // it up. Judged per screen, so a viewer only ever moves their own.
+          if (t === this.recvTransport && state !== 'failed') this._recheckLayers();
         });
       }
       this.sendTransport.on('produce', ({ kind, rtpParameters, appData }, done, fail) => {
@@ -122,12 +126,20 @@
       const { consumer: c } = await this._request('relay:consume', { producerId, rtpCapabilities: this.device.rtpCapabilities });
       if (this.closed) return;
       const consumer = await this.recvTransport.consume({ id: c.id, producerId: c.producerId, kind: c.kind, rtpParameters: c.rtpParameters });
-      const entry = { consumer, userId: c.userId, source: c.source };
+      // `layer` is what this viewer currently has from the relay: null means the
+      // top one. Only screen video has a choice; the rest stay undefined.
+      const entry = { consumer, userId: c.userId, source: c.source, layer: c.spatialLayer ?? null };
       this.consumers.set(producerId, entry);
       consumer.on('trackended', () => this._dropConsumer(producerId));
       consumer.on('transportclose', () => this._dropConsumer(producerId));
       this.opts.onTrack?.({ userId: c.userId, source: c.source, track: consumer.track, producerId });
       await this._request('relay:resume', { consumerId: c.id });
+      this._autoLayer(producerId, entry);
+    }
+
+    /** Re-judges the layer of every screen this viewer is receiving. */
+    _recheckLayers() {
+      for (const [producerId, entry] of this.consumers) this._autoLayer(producerId, entry);
     }
 
     _dropConsumer(producerId) {
@@ -196,6 +208,57 @@
      */
     async setPaused(source, paused) {
       await this._request('relay:set-paused', { source, paused });
+    }
+
+    /**
+     * Asks the relay for a different quality layer of a screen share.
+     *
+     * A screen is sent in two encodings — half size and full — and the relay
+     * forwards only the layer asked for to this consumer alone. So a viewer on
+     * a weak link stops taking the full-rate one off the server without anyone
+     * else's picture changing. The sharer's own sending is not affected.
+     *
+     * @param {string} producerId whose screen
+     * @param {number|null} spatialLayer 0 for the small one, 1 for full, null for
+     *   whatever the top layer is
+     */
+    async setPreferredLayers(producerId, spatialLayer, temporalLayer = null) {
+      await this._request('relay:set-preferred-layers', { producerId, spatialLayer, temporalLayer });
+    }
+
+    /**
+     * Picks a screen layer from this viewer's own downlink, so the choice needs
+     * no UI and needs no signalling history: on a link that cannot carry the
+     * full encoding, take the small one; once it recovers, take the full one
+     * back. Aimed only at screen video — the voice and the screen's audio are
+     * single-layer and are left alone.
+     */
+    _autoLayer(producerId, entry) {
+      if (entry.source !== 'screen' || !this.recvTransport || this.recvTransport.closed) return;
+      const wanted = this._downlinkHealthy() ? null : 0;
+      // Null means "the top layer", which is 1 here; only the small one is ever
+      // forced, so a link that is merely unmeasured is never downgraded.
+      if (wanted === null && entry.layer === 0) {
+        this.setPreferredLayers(producerId, null).catch(() => {});
+        entry.layer = null;
+      } else if (wanted === 0 && entry.layer !== 0) {
+        this.setPreferredLayers(producerId, 0).catch(() => {});
+        entry.layer = 0;
+      }
+    }
+
+    /**
+     * True while the receiving connection looks able to take the full layer.
+     * Only the connection state is judged, not a bitrate estimate: the browser
+     * does not report a reliable available-downlink figure here, and a guess
+     * that is wrong in the wrong direction would cost a viewer quality. A link
+     * that has actually failed is the one case worth dropping to the small
+     * layer on, because the full one cannot be getting through anyway.
+     */
+    _downlinkHealthy() {
+      const t = this.recvTransport;
+      if (!t || t.closed) return true;
+      return t.connectionState !== 'failed' && t.connectionState !== 'disconnected';
     }
 
     /** Stops sending `source`. */

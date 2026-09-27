@@ -233,7 +233,27 @@ test('#3 screen audio only flows to the people with the tile open', async (t) =>
   assert.equal(consumerOf(relay, '11111111', 'u2', 'screen-audio').paused, true);
 });
 
-// ── 4. relay:consume rate limit, bitrate and set-paused ──────
+
+const VM_SOURCE = require('node:fs').readFileSync(
+  require('node:path').join(__dirname, '..', 'public', 'js', 'voice-relay.js'), 'utf8');
+
+/** The client's own auto-layer choice, loaded as-is and driven with a fake transport. */
+function loadClientLayerPicker(recvState = 'connected') {
+  const context = require('node:vm').createContext({
+    module: { exports: {} },
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout, clearTimeout, Date,
+  });
+  require('node:vm').runInContext(`${VM_SOURCE}\nmodule.exports = HavenRelaySession;`, context, { filename: 'voice-relay.js' });
+  const Session = context.module.exports;
+  const session = Object.create(Session.prototype);
+  const asked = [];
+  session.consumers = new Map();
+  session.recvTransport = { closed: false, connectionState: recvState };
+  session.setPreferredLayers = async (producerId, spatialLayer, temporalLayer) => { asked.push({ producerId, spatialLayer, temporalLayer }); };
+  return { session, asked, setState: (s) => { session.recvTransport.connectionState = s; } };
+}
+
 // These go through the socket layer, because the limit, the setting and the
 // permission check all live there and none of them are visible from the relay.
 

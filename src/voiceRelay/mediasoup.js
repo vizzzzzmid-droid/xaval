@@ -50,16 +50,50 @@ function lanAddress() {
   return null;
 }
 
+// ── Limits ──────────────────────────────────────────────────────
+// What a single call, or a single person in it, may cost the relay. Without
+// them a member of a call can add a transport, a producer and a consumer at a
+// time, and a bug or a hostile client makes the router grow until the worker
+// runs out of memory — which takes every call on that worker down, not just
+// the offending one.
+//
+// The defaults are sized for a big voice room, not for a small one: a normal
+// call is 5-20 people, and one person publishes at most 4 tracks (mic, screen,
+// its audio, webcam) and receives at most 3 per other person, so a 20-person
+// call with a screen share sits near 60 consumers. An admin on a small server
+// can lower them with the environment variables below.
+function intEnv(name, fallback, min, max) {
+  const raw = parseInt(process.env[name], 10);
+  if (!Number.isInteger(raw)) return fallback;
+  return Math.max(min, Math.min(max, raw));
+}
+
+const LIMITS = {
+  /** Media workers, each with its own port. */
+  maxWorkers: intEnv('HAVEN_SFU_MAX_WORKERS', 8, 1, 64),
+  /** People in one relayed call. */
+  maxPeersPerRoom: intEnv('HAVEN_SFU_MAX_PEERS_PER_ROOM', 100, 2, 1000),
+  /** Tracks one person may send at once. */
+  maxProducersPerPeer: intEnv('HAVEN_SFU_MAX_PRODUCERS_PER_PEER', 8, 1, 32),
+  /** Tracks one person may receive at once. */
+  maxConsumersPerPeer: intEnv('HAVEN_SFU_MAX_CONSUMERS_PER_PEER', 100, 1, 1000),
+  /** Screen shares going out of one call at once. */
+  maxScreenProducersPerRoom: intEnv('HAVEN_SFU_MAX_SCREEN_SHARES', 8, 1, 64),
+};
+
 class MediasoupRelay {
   /**
    * @param {object} opts
    * @param {() => {port:number, workers:number, address:string}} opts.settings
    * @param {(code:string) => void} [opts.onRoomLost] a call's relay went away
    *        (its worker crashed); the people in it need to reconnect.
+   * @param {object} [opts.limits] overrides for the caps above, for a test that
+   *        needs a small room without joining a hundred people to find the edge.
    */
-  constructor({ settings, onRoomLost }) {
+  constructor({ settings, onRoomLost, limits }) {
     this.settings = settings;
     this.onRoomLost = onRoomLost || (() => {});
+    this.limitOverrides = limits || {};
     this.workers = [];          // { worker, webRtcServer, rooms: Set<code> }
     this.rooms = new Map();     // code -> { router, slot, peers: Map<peerId, Peer> }
     this.state = 'stopped';     // stopped | starting | running | error | unavailable
@@ -69,6 +103,12 @@ class MediasoupRelay {
   }
 
   static available() { return !!loadMediasoup(); }
+
+  /** The caps in force, so the admin page and the tests can read the real ones. */
+  limits() { return { ...LIMITS, ...this.limitOverrides }; }
+
+  /** One cap in force. Read through this so an override counts everywhere. */
+  _limit(name) { return this.limits()[name]; }
 
   status() {
     return {
@@ -93,8 +133,17 @@ class MediasoupRelay {
   async _start() {
     this.state = 'starting';
     this.error = null;
-    const { port, workers, address } = this.settings();
+    // Reading the settings is inside the try like everything else: the setting
+    // comes from a query, so a database hiccup must be a relay that is
+    // reported as not working, never an exception thrown into the caller that
+    // tried to start a call.
+    let port = null;
+    let workers = 1;
     try {
+      const settings = this.settings() || {};
+      port = settings.port;
+      workers = settings.workers;
+      const address = settings.address;
       const lan = lanAddress();
       let announced = (address || '').trim();
       if (!announced) announced = await detectPublicIp().catch(() => null) || lan;
@@ -102,7 +151,15 @@ class MediasoupRelay {
       this.address = announced;
       const listenIp = lan || '0.0.0.0';
 
-      for (let i = 0; i < workers; i++) {
+      // The admin's setting wins over the environment default, but neither can
+      // start more workers than the host is allowed to. A worker is a whole
+      // process with its own port, so an unbounded count is the one limit that
+      // has to be enforced before the loop, not while it runs.
+      const wanted = Math.max(1, Math.min(workers, this._limit('maxWorkers')));
+      if (wanted < workers) {
+        console.warn(`[Voice] Relay asked for ${workers} workers, starting ${wanted} (HAVEN_SFU_MAX_WORKERS).`);
+      }
+      for (let i = 0; i < wanted; i++) {
         const worker = await loadMediasoup().createWorker({ logLevel: 'warn' });
         const slot = { worker, webRtcServer: null, port: port + i, rooms: new Set() };
         worker.on('died', (err) => this._workerDied(slot, err));
@@ -116,7 +173,7 @@ class MediasoupRelay {
         this.workers.push(slot);
       }
       this.state = 'running';
-      console.log(`🔊 Voice relay running on ${this.address}, port${workers > 1 ? `s ${port}-${port + workers - 1}` : ` ${port}`} (UDP and TCP)`);
+      console.log(`🔊 Voice relay running on ${this.address}, port${wanted > 1 ? `s ${port}-${port + wanted - 1}` : ` ${port}`} (UDP and TCP)`);
       return true;
     } catch (err) {
       this.error = /EADDRINUSE|address in use/i.test(String(err.message))
@@ -133,8 +190,14 @@ class MediasoupRelay {
   /** Stops everything. Every relayed call is dropped. */
   async stop(keepState = false) {
     const codes = [...this.rooms.keys()];
-    this.rooms.clear();
+    // Each call is torn down properly, not merely forgotten: its producers,
+    // consumers, transports and router are closed first. Clearing the map
+    // without that leaves live mediasoup objects behind, which keeps the
+    // worker processes alive after the relay is switched off.
+    for (const code of codes) this.closeChannel(code);
     for (const slot of this.workers) {
+      slot.rooms.clear();
+      try { slot.webRtcServer?.close(); } catch { /* already gone */ }
       try { slot.worker.close(); } catch { /* already gone */ }
     }
     this.workers = [];
@@ -145,8 +208,11 @@ class MediasoupRelay {
   _workerDied(slot, err) {
     console.error('Voice relay worker stopped unexpectedly:', err?.message || err);
     this.workers = this.workers.filter(w => w !== slot);
-    for (const code of slot.rooms) {
-      this.rooms.delete(code);
+    // A worker's death leaves its routers and transports as dead handles, and
+    // every call on it with no media. Each is closed and told so, so it can
+    // carry on direct — and so no call state outlives the worker holding it.
+    for (const code of [...slot.rooms]) {
+      this.closeChannel(code);
       this.onRoomLost(code);
     }
     if (!this.workers.length) {
@@ -161,8 +227,11 @@ class MediasoupRelay {
     let room = this.rooms.get(code);
     if (room) return room;
     if (!(await this.start())) throw new Error(this.error || 'Voice relay is not running');
-    // The worker carrying the fewest calls takes the new one.
+    // The worker carrying the fewest calls takes the new one. With no worker
+    // left there is nothing to put a router on, and a crash there would take the
+    // process down; the call is refused instead and carries on peer to peer.
     const slot = [...this.workers].sort((a, b) => a.rooms.size - b.rooms.size)[0];
+    if (!slot) throw new Error(this.error || 'Voice relay is not running');
     const router = await slot.worker.createRouter({ mediaCodecs: MEDIA_CODECS });
     room = this.rooms.get(code);   // another join may have won the race
     if (room) { router.close(); return room; }
@@ -182,6 +251,11 @@ class MediasoupRelay {
   /** Joins a call: what the browser needs to set up its two connections. */
   async join(code, peerId, userId) {
     const room = await this._room(code);
+    // Rejoining is a reconnect, not a second person: it replaces the session
+    // the caller already has, so it is not counted against the room.
+    if (!room.peers.has(peerId) && room.peers.size >= this._limit('maxPeersPerRoom')) {
+      throw new Error('This call is full');
+    }
     if (room.peers.has(peerId)) this.leave(code, peerId);
     // `watching`: sharers whose screen this person has open. Screen video is
     // only sent while it is, which is what keeps big screen shares affordable:
@@ -224,12 +298,36 @@ class MediasoupRelay {
 
   /** Starts sending one track (mic, screen, webcam...) into the call. */
   async produce(code, peerId, transportId, kind, rtpParameters, source) {
-    const { peer } = this._peer(code, peerId);
+    const { room, peer } = this._peer(code, peerId);
     const t = peer.transports.get(transportId);
     if (!t || t.appData.direction !== 'send') throw new Error('Unknown connection');
     // One track per source: a new mic replaces the old one.
     for (const [id, p] of peer.producers) {
       if (p.appData.source === source) { p.close(); peer.producers.delete(id); }
+    }
+    // Counted after the replacement above, so switching devices (which closes
+    // one track and opens another) is never refused, and a refused request
+    // leaves nothing behind: the checks run before anything is created.
+    if (peer.producers.size >= this._limit('maxProducersPerPeer')) {
+      throw new Error('You have too many tracks open');
+    }
+    if (source === 'screen' || source === 'screen-audio') {
+      // Counted per person, because a screen is published as a video and its
+      // audio, in either order, and both are one share. A share is a peer that
+      // is sending either of them, so replacing a screen's audio with video (a
+      // client that starts sending audio later) is never a second share.
+      let sharers = 0;
+      for (const other of room.peers.values()) {
+        for (const p of other.producers.values()) {
+          if (p.appData.source === 'screen' || p.appData.source === 'screen-audio') { sharers++; break; }
+        }
+      }
+      const mine = [...peer.producers.values()].some(
+        p => p.appData.source === 'screen' || p.appData.source === 'screen-audio'
+      );
+      if (!mine && sharers >= this._limit('maxScreenProducersPerRoom')) {
+        throw new Error('This call already has enough screen shares');
+      }
     }
     const producer = await t.produce({ kind, rtpParameters, appData: { source, userId: peer.userId } });
     peer.producers.set(producer.id, producer);
@@ -280,8 +378,13 @@ class MediasoupRelay {
    *   the receiving side, which is where the server's own bandwidth goes, and
    *   is the cap the admin asked for regardless of what the sender negotiated.
    */
-  async consume(code, peerId, producerId, rtpCapabilities, { micBitrate = 0 } = {}) {
+  async consume(code, peerId, producerId, rtpCapabilities, { micBitrate = 0, spatialLayer = null } = {}) {
     const { room, peer } = this._peer(code, peerId);
+    // Checked before anything is created, so a refused request leaves no
+    // consumer and no half-wired state behind.
+    if (peer.consumers.size >= this._limit('maxConsumersPerPeer')) {
+      throw new Error('You are already receiving too many tracks');
+    }
     if (!room.router.canConsume({ producerId, rtpCapabilities })) return null;
     const t = [...peer.transports.values()].find(x => x.appData.direction === 'recv');
     if (!t) throw new Error('No receiving connection');
@@ -297,9 +400,23 @@ class MediasoupRelay {
     peer.consumers.set(consumer.id, consumer);
     consumer.on('producerclose', () => peer.consumers.delete(consumer.id));
     consumer.on('transportclose', () => peer.consumers.delete(consumer.id));
+    // A viewer that already knows its link is slow can start on the cheap layer
+    // instead of pulling the full one for the first second and then dropping.
+    // Only screen video has layers, and any value is clamped to the real ones.
+    if (source === 'screen' && spatialLayer != null) {
+      const available = consumer.rtpParameters.encodings?.length ?? 1;
+      const top = Math.max(0, Math.min(available - 1, spatialLayer));
+      await consumer.setPreferredLayers({ spatialLayer: top, temporalLayer: null });
+      consumer.appData.spatialLayer = top;
+    } else {
+      consumer.appData.spatialLayer = null;
+    }
     return {
       id: consumer.id, producerId, kind: consumer.kind, rtpParameters: consumer.rtpParameters,
       userId: owner?.userId ?? null, source,
+      // What the relay settled on, so the client knows which layer it is already
+      // on and only has to ask for a different one.
+      spatialLayer: consumer.appData.spatialLayer ?? null,
     };
   }
 
@@ -311,6 +428,55 @@ class MediasoupRelay {
     // A screen's video and its audio both wait until its tile is open.
     if (GATED_SOURCES.has(c.appData.source) && !peer.watching.has(c.appData.sharerId)) return;
     await c.resume();
+  }
+
+  /**
+   * Chooses which of a screen share's simulcast layers this viewer gets.
+   *
+   * A screen is published with two encodings (see HavenRelaySession.publish):
+   * layer 0 is half size, layer 1 full. Asking for a lower layer makes the
+   * relay forward the cheaper one to this consumer only, so a viewer on a slow
+   * link stops pulling the full-rate layer off the server without holding
+   * anyone else's picture down. The sharer's producer is not touched, and a
+   * consumer only ever speaks for the peer that owns it.
+   *
+   * @param {number|null} spatialLayer highest layer wanted, or null for all
+   * @param {number|null} temporalLayer highest temporal layer wanted, or null
+   * @returns {Promise<{spatialLayer:number, temporalLayer:number|null}>} the
+   *   layers now in force, so a caller can tell a clamp from what it asked for
+   */
+  async setPreferredLayers(code, peerId, producerId, { spatialLayer = null, temporalLayer = null } = {}) {
+    const { peer } = this._peer(code, peerId);
+    // Consumers are filed under their own id, so the one for this producer is
+    // found by its producerId — and only among this peer's consumers, which is
+    // what stops a client from moving somebody else's screen consumer.
+    let consumer = null;
+    for (const c of peer.consumers.values()) {
+      if (c.producerId === producerId) { consumer = c; break; }
+    }
+    if (!consumer) throw new Error('You are not receiving that track');
+    // A screen's quality is the only thing layers apply to. Mic and screen
+    // audio have one encoding, so there is nothing to choose and saying so
+    // beats silently pretending it worked.
+    if (consumer.appData.source !== 'screen') throw new Error('That track has no quality layers');
+    // The layers that exist are the ones the *producer* sends: a screen is
+    // published with two encodings, and a consumer is given one encoding of its
+    // own, so the count has to come from the producer. Clamping to it means a
+    // client asking for a layer that does not exist gets the top real one
+    // instead of an error or a stream the relay cannot forward.
+    const room = this.rooms.get(code);
+    const producer = room && [...room.peers.values()]
+      .map(p => p.producers.get(producerId))
+      .find(Boolean);
+    const available = producer?.rtpParameters?.encodings?.length ?? 1;
+    const top = Math.max(0, Math.min(available - 1, spatialLayer == null ? available - 1 : spatialLayer));
+    const temporal = temporalLayer == null ? null : Math.max(0, temporalLayer);
+    await consumer.setPreferredLayers({ spatialLayer: top, temporalLayer: temporal });
+    // Kept so the current choice is knowable later, and so the initial consume
+    // and a later change cannot disagree.
+    consumer.appData.spatialLayer = top;
+    consumer.appData.temporalLayer = temporal;
+    return { spatialLayer: top, temporalLayer: temporal };
   }
 
   /** The person opened (or closed) a sharer's screen: start or stop it. */

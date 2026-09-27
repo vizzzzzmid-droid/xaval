@@ -109,7 +109,21 @@ module.exports = function registerVoiceRelay(socket, ctx) {
     return { producers: voiceRelay.producers(code, peerId()) };
   });
 
-  handle('relay:consume', async ({ code, producerId, rtpCapabilities }) => {
+  handle('relay:set-preferred-layers', async ({ code, producerId, spatialLayer, temporalLayer }) => {
+    if (!ID.test(String(producerId))) throw new Error('Bad request');
+    // Both are optional, but a value that is sent has to be a plain layer
+    // number — the client's own idea of a quality tier, which the relay clamps
+    // to the encodings the producer really has.
+    const layer = (v) => (v === undefined || v === null ? null : (Number.isInteger(v) ? v : NaN));
+    const spatial = layer(spatialLayer);
+    const temporal = layer(temporalLayer);
+    if (Number.isNaN(spatial) || Number.isNaN(temporal)) throw new Error('Bad request');
+    // The consumer is looked up in the caller's own peer, so one viewer cannot
+    // reach another's screen consumer even by guessing a producer id.
+    return voiceRelay.setPreferredLayers(code, peerId(), producerId, { spatialLayer: spatial, temporalLayer: temporal });
+  });
+
+  handle('relay:consume', async ({ code, producerId, rtpCapabilities, options }) => {
     if (!ID.test(String(producerId)) || !rtpCapabilities || typeof rtpCapabilities !== 'object') throw new Error('Bad request');
     // Consume is the one relay call a client can repeat freely with different
     // producer ids, and each one that lands costs a real consumer in the
@@ -161,5 +175,6 @@ module.exports = function registerVoiceRelay(socket, ctx) {
 
 module.exports.RELAY_EVENTS = [
   'relay:join', 'relay:connect', 'relay:produce', 'relay:producers',
-  'relay:consume', 'relay:resume', 'relay:set-paused', 'relay:close-producer',
+  'relay:consume', 'relay:resume', 'relay:set-paused',
+  'relay:set-preferred-layers', 'relay:close-producer',
 ];
