@@ -2622,6 +2622,11 @@ class VoiceManager {
         return false;
       }
       this.screenStream = capturedStream;
+      // Electron's own capture (see the getDisplayMedia override in the
+      // desktop app's preload) hands back one plain encoding per track — it
+      // cannot be asked for several layers the way a browser encoder can. Keep
+      // the origin so the relay is told the truth about what it is publishing.
+      this._screenFromElectron = isElectron;
 
       this.isScreenSharing = true;
 
@@ -3812,7 +3817,14 @@ class VoiceManager {
       const maxBitrate = this._screenBitrates?.[res] || this._screenBitrates?.[0];
       const v = this.screenStream.getVideoTracks()[0];
       const a = this.screenStream.getAudioTracks()[0];
-      if (v) await relay.publish('screen', v, { maxBitrate, simulcast: true }).catch(err => console.warn('[Relay] Screen not sent:', err.message));
+      // Several layers, so a viewer on a weak link can drop to the small one
+      // without holding the rest back — but only where the capture can actually
+      // produce them. Electron's screen capture sends one encoding, and asking
+      // it for two would make the relay promise layers that never arrive: the
+      // viewer's layer choice would then have nothing to select and everyone
+      // would be served the top of it. Such a share goes up as a single layer.
+      const simulcast = !this._screenFromElectron;
+      if (v) await relay.publish('screen', v, { maxBitrate, simulcast }).catch(err => console.warn('[Relay] Screen not sent:', err.message));
       if (a) await relay.publish('screen-audio', a).catch(err => console.warn('[Relay] Screen audio not sent:', err.message));
     }
     const cam = this.isWebcamActive && this.webcamStream?.getVideoTracks()[0];
